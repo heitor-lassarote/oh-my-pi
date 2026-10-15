@@ -1,9 +1,11 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { createRoot, effect, type JSXNode, onCleanup, type Signal, signal, type UiNode } from "@oh-my-pi/pi-tui";
 import { bubblePaste, pathTo } from "@oh-my-pi/pi-tui/dispatch";
 import { decodeInput } from "@oh-my-pi/pi-tui/driver/input/decoder";
 import { widgetContext, widgetFor } from "@oh-my-pi/pi-tui/term/widgets";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
+import { prompt as promptTemplates } from "@oh-my-pi/pi-utils";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { CollabHost } from "../../collab/host";
 import type {
@@ -34,6 +36,7 @@ import { extensionLinkClicksAvailable } from "../../extensibility/extensions/lin
 import type { ExtensionUiHost } from "../../extensibility/extensions/render-types";
 import { cfgExtensionAssistantTextRenderers } from "../../extensibility/settings";
 import type { ComposerOwner, InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
+import approvalLineTemplate from "../../prompts/steering/approval-line.md" with { type: "text" };
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { launchTerminal } from "../../subprocess/terminal-launch";
 import { approvalAnswerForChoice, approvalChoiceLabels, approvalOnceLabel } from "../../tools/approval";
@@ -56,7 +59,7 @@ import { type ApprovalChoice, ApprovalDialog } from "../../ui/overlays/panels/ap
 import { AskDialog, AskDialogModel } from "../../ui/overlays/panels/ask-dialog";
 import { HookEditor, type HookEditorHandle, HookInput } from "../../ui/overlays/panels/hook-dialogs";
 import { HookSelector } from "../../ui/overlays/pickers/hook-selector";
-import type { OverlayHandle, OverlayOptions } from "../../ui/shell";
+import { within, type OverlayHandle, type OverlayOptions } from "../../ui/shell";
 import { findNode } from "../../ui/styles/panels/common";
 import { registerComposerShape } from "../../ui/styles/composer/shapes";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme } from "../../ui/theme/service";
@@ -194,6 +197,12 @@ export class ExtensionUiController {
 	 * and does not answer it.
 	 */
 	#denyingSteering: readonly AgentMessage[] | undefined;
+	/**
+	 * Steering messages an approval answered with: the approve chord's own note, and the custom
+	 * messages a `/skill:` dispatch it triggered pushed onto the queue. The deny-watch skips them,
+	 * so approving a call never answers its own prompt.
+	 */
+	#approvedApprovalSteers = new WeakSet<AgentMessage>();
 	/**
 	 * Built once in `initHooksAndCustomTools()`. Reused directly by `/tree`
 	 * `ask` re-answer (issue #5642) to drive a standalone `AskTool.execute()`
@@ -608,16 +617,16 @@ export class ExtensionUiController {
 	}
 
 	/**
-	 * The tool-approval prompt in the composer's place; a collab guest answers it as a select over
-	 * the full prompt with the same choices ({@link approvalChoiceLabels}): the prompt's grants when
-	 * it offers any, Approve, its "for this session" choice when it offers one, and Deny. Locally it
-	 * shows the compact prompt (the details summarized to a
-	 * row, so the composer beneath keeps its room) over that list, and the expand key
-	 * swaps in the full one, wrapped — even when the two match, since a row the summary kept whole
-	 * can still clip. The composer stays mounted beneath it and takes the typing: a user message
-	 * queued as steering while the call waits (sent here, from Tern, or by a collab guest) denies
-	 * the call, so the message tells the agent why instead of a bare denial. The watch starts with
-	 * the request, so approvals still queued behind another dialog are denied by the same message.
+	 * The tool-approval prompt in the composer's place. A collab guest answers it as a select over
+	 * the full prompt with the same choices from {@link approvalChoiceLabels}. Locally the compact
+	 * prompt rides over the choice list, and the composer stays mounted beneath it and takes the
+	 * typing. A message sent from the composer, from Tern, or by a collab guest denies the call and
+	 * steers, naming the denial in the steer. `app.approval.approve` (Ctrl+Enter by default) sends
+	 * the draft as a note that names the call it approves — dispatched commands and dispatch failures
+	 * leave the prompt pending, with the draft only consumed when the note actually goes out. The
+	 * note and anything a dispatched `/skill:` pushed onto the queue are marked approved, so they
+	 * never deny the prompt that sent them. Approvals queued behind this dialog are denied by the
+	 * same message.
 	 */
 	async showCollabAwareApproval(
 		prompt: ExtensionApprovalPrompt,
@@ -643,12 +652,21 @@ export class ExtensionUiController {
 			if (event.type !== "queue_update" || steered.signal.aborted) return;
 			const current = agent.peekSteeringQueue();
 			if (event.steering.length > steeringBaseline) {
-				const added = current.filter(message => !knownSteering.has(message));
-				this.#denyingSteering = added;
-				// One-at-a-time delivery takes the oldest steer at the batch boundary; the
-				// message that denied this call must be the one that lands after the denial.
-				agent.prioritizeSteering(added);
-				steered.abort();
+				// Messages the approval itself queued (its note, a dispatched skill) answer it, so they
+				// never deny it; the baseline still counts them.
+				const added = current.filter(
+					message => !knownSteering.has(message) && !this.#approvedApprovalSteers.has(message),
+				);
+				if (added.length > 0) {
+					this.#denyingSteering = added;
+					// One-at-a-time delivery takes the oldest steer at the batch boundary; the
+					// message that denied this call must be the one that lands after the denial.
+					agent.prioritizeSteering(added);
+					steered.abort();
+				} else {
+					steeringBaseline = event.steering.length;
+					knownSteering = new Set(current);
+				}
 			} else {
 				steeringBaseline = event.steering.length;
 				knownSteering = new Set(current);
@@ -660,15 +678,61 @@ export class ExtensionUiController {
 				this.#presentDialog({ kind: "permission", msg: prompt.compact }, localSignal, settle => {
 					const composer = this.ctx.composer;
 					const grants = prompt.grants ?? [];
+					/** The prompt has been answered; a note queued after that carries no approval line. */
+					let settled = false;
+					localSignal?.addEventListener(
+						"abort",
+						() => {
+							settled = true;
+						},
+						{ once: true },
+					);
+					if (localSignal?.aborted) settled = true;
+					const settleAnswer = (value: string | undefined): void => {
+						settled = true;
+						settle(value);
+					};
 					const answer = (choice: ApprovalChoice): void => {
-						if (choice.kind === "once") settle(onceLabel);
-						else if (choice.kind === "session") settle(sessionLabel);
+						if (choice.kind === "once") settleAnswer(onceLabel);
+						else if (choice.kind === "session") settleAnswer(sessionLabel);
 						else {
 							const grant = grants[choice.index];
-							settle(grant && (choice.remember ? grant.alwaysLabel : grant.label));
+							settleAnswer(grant ? (choice.remember ? grant.alwaysLabel : grant.label) : undefined);
 						}
 					};
-					const hasDraft = (): boolean => composer.text().length > 0 || composer.pendingImages.length > 0;
+					/** Approve and send the composer's note; true leaves the prompt pending. */
+					const sendDraft = async (): Promise<boolean> => {
+						// The chord bypasses composer.submit(): atom expansion is its own.
+						const note = composer.expandedText().trim();
+						if (composer.text().length === 0 && composer.pendingImages.length === 0) return false;
+						// Consume the text before dispatch; attachments stay until the submit path takes them,
+						// a failed dispatch puts the draft back, and clearing the draft closes any completion popup.
+						composer.setText("");
+						try {
+							const outcome = await this.ctx.submitApprovalNote(note, {
+								steer: async (text, images) => {
+									if (settled) {
+										// The answer already landed while a hook waited: queue the note without
+										// an approval line, so the model gets the denial it actually received.
+										await this.ctx.session.steer(text, images, { attribution: "user" });
+										return;
+									}
+									await this.#steerApprovalNote(text, images, prompt);
+								},
+								onSkillQueued: queued => {
+									if (!settled) this.#markApprovedApprovalMessages(queued);
+								},
+							});
+							return outcome !== "steered";
+						} catch (error) {
+							// A rejected chord leaves the prompt up with the draft intact for a retry.
+							if (!composer.text()) composer.setText(note);
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+							return true;
+						}
+					};
+					const hasDraft = (): boolean =>
+						composer.text().length > 0 || composer.pendingImages.length > 0 || this.ctx.pasteInFlight();
 					// Keep focus on the dialog, but give edits, pastes and undo to the real composer field.
 					const field = composer.field;
 					const path = pathTo([composer.node], field);
@@ -686,8 +750,14 @@ export class ExtensionUiController {
 							(node = singleNode(
 								ApprovalDialog({
 									prompt: prompt.compact,
-									onApprove: answer,
-									onDeny: () => settle("Deny"),
+									/** `true` keeps the prompt open: a dispatched command, or nothing sent, owns the keys next. */
+									onApprove: async (choice: ApprovalChoice) => {
+										if (await sendDraft()) return true;
+										if (settled) return true;
+										answer(choice);
+										return false;
+									},
+									onDeny: () => settleAnswer("Deny"),
 									options: {
 										fullPrompt: prompt.full,
 										timeout: dialogOptions?.timeout,
@@ -698,10 +768,13 @@ export class ExtensionUiController {
 										...(grants.length > 0 ? { grants } : {}),
 										draft: {
 											hasDraft,
+											pasteInFlight: () => this.ctx.pasteInFlight(),
 											handleInput: key => {
 												if (this.ctx.keybindings.matches(key, "app.clear")) composer.clearDraft();
 												else if (this.ctx.keybindings.matches(key, "app.clipboard.pasteImage"))
 													void this.ctx.handleImagePaste();
+												else if (this.ctx.keybindings.matches(key, "app.clipboard.pasteTextRaw"))
+													void this.ctx.handleClipboardTextRawPaste();
 												else if (!composer.handleDraftKey(key))
 													widgetFor(field)?.key?.(field, key, fieldContext());
 											},
@@ -714,15 +787,25 @@ export class ExtensionUiController {
 								}),
 							)),
 					);
-					if (node) this.ctx.shell.focus(node);
+					// The dialog is home while mounted, so a command modal that closes gives the keys back to it.
+					const savedHome = this.ctx.shell.home();
+					if (node) {
+						this.ctx.shell.setHome(node);
+						this.ctx.shell.focus(node);
+					}
 					// Its submissions steer this (main) session, even from a focused agent's view.
 					this.ctx.approvalOwnsComposer = true;
 					const releaseComposerOwner = node ? this.#claimComposerOwner(node, () => true) : () => {};
 					return () => {
 						this.ctx.approvalOwnsComposer = false;
+						if (node && this.ctx.shell.home() === node) {
+							this.ctx.shell.setHome(savedHome && !savedHome.disposed ? savedHome : this.ctx.composer.field);
+						}
 						releaseComposerOwner();
+						const focused = this.ctx.shell.focused();
+						const held = node !== undefined && focused !== null && (focused === node || within(focused, node));
 						slot.clear();
-						this.#focusComposer();
+						if (held) this.ctx.shell.focus(null);
 					};
 				}),
 			);
@@ -730,6 +813,28 @@ export class ExtensionUiController {
 		} finally {
 			unsubscribe();
 		}
+	}
+
+	/** Steer a chord's note as the user's own message, naming the call it approves. */
+	async #steerApprovalNote(
+		note: string,
+		images: ImageContent[] | undefined,
+		prompt: ExtensionApprovalPrompt,
+	): Promise<void> {
+		await this.ctx.session.steer(note, images, {
+			attribution: "user",
+			approvalLine: this.#approvalLine(prompt.toolName),
+			onPromptQueued: queued => this.#markApprovedApprovalMessages(queued),
+		});
+	}
+
+	/** Record messages the approval answered with, so the deny-watch skips them. */
+	#markApprovedApprovalMessages(queued: readonly AgentMessage[]): void {
+		for (const message of queued) this.#approvedApprovalSteers.add(message);
+	}
+
+	#approvalLine(toolName: string | undefined): string {
+		return promptTemplates.render(approvalLineTemplate, { toolName });
 	}
 
 	async showAskDialog(

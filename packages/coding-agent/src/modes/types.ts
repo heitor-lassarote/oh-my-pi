@@ -142,6 +142,17 @@ export interface ComposerOwner {
 	owns(): boolean;
 }
 
+/** Outcome of submitting text through the approval entry point. */
+export type ApprovalSubmitOutcome = "steered" | "dispatched" | "kept";
+
+/** Approval chord submission callbacks supplied by the approval dialog's host. */
+export interface ApprovalSubmitOptions {
+	/** Queue the note as a steer; settling the approval is the caller's, not this callback's. */
+	steer(text: string, images?: ImageContent[]): Promise<void>;
+	/** Called synchronously with the messages an inline skill dispatch pushed onto the steering queue. */
+	onSkillQueued?: (queued: readonly AgentMessage[]) => void;
+}
+
 /**
  * The dock's live models, one per HUD. The interactive mode mounts each model's view in its
  * dock slot once at startup; controllers only set the models' signals and callbacks (no slot
@@ -510,6 +521,8 @@ export interface InteractiveModeContext {
 	approvalOwnsComposer?: boolean;
 	/** The mounted dialog that currently hands typing to the composer, if any. */
 	composerOwner?: ComposerOwner;
+	/** Submit an approval-note chord through InputController and report whether the approval should settle. */
+	submitApprovalNote(text: string, options?: ApprovalSubmitOptions): Promise<ApprovalSubmitOutcome>;
 	/**
 	 * An image-accepting prompt in the composer's place (an extension editor that takes images):
 	 * image pastes attach there instead of being refused. Set by whoever mounts it.
@@ -1034,6 +1047,10 @@ export interface InteractiveModeContext {
 	resetDisplayAfterAppearanceRefresh(): void;
 	handleDequeue(): void;
 	handleImagePaste(): Promise<boolean>;
+	/** Whether a clipboard paste is still landing into the composer: keys typed behind it wait, and a submit chord must not fire. */
+	pasteInFlight(): boolean;
+	/** Paste the clipboard's text as plain draft text, bypassing the large-paste menu; later input waits for it. */
+	handleClipboardTextRawPaste(): Promise<void>;
 	/** Attach a pasted image path to the main editor or an image-accepting prompt; other prompts refuse. */
 	handleImagePathPaste(path: string): Promise<void>;
 	/**

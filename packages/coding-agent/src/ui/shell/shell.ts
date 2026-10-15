@@ -265,6 +265,11 @@ export class Shell {
 	/** The node holding keyboard focus (reactive). */
 	readonly focused: Accessor<UiNode | null> = () => this.surface.focused();
 
+	/** The node focus falls back to. */
+	home(): UiNode | null {
+		return this.#home;
+	}
+
 	/** Move keyboard focus; `null` returns it to the home node. */
 	focus(node: UiNode | null): void {
 		this.surface.focus(node ?? this.#home);

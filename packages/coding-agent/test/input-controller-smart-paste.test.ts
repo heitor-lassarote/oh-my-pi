@@ -7,9 +7,14 @@
  */
 
 import { describe, expect, it, vi } from "bun:test";
+import type { KeyEvent } from "@oh-my-pi/pi-tui/events";
+import type { InputEvent } from "@oh-my-pi/pi-tui/driver/contract";
+import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings/keybindings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { Composer } from "../src/ui/composer/composer";
+import { createInputHarness, keyEvent } from "./helpers/input-harness";
 
 function createContext(options?: { focused?: object }) {
 	const composer = new Composer();
@@ -175,5 +180,131 @@ describe("InputController paste over SSH", () => {
 		expect(spies.insertText).not.toHaveBeenCalled();
 		expect(spies.insertText).not.toHaveBeenCalled();
 		expect(spies.showStatus).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("raw text paste key replay", () => {
+	it("holds keys typed behind a pending raw clipboard read", async () => {
+		const composer = new Composer();
+		// The terminal normally feeds printable keys into the native field; without a
+		// native backend here the focused field needs an editable stand-in so the
+		// controller's held-key replay can reach it.
+		const originalOnKey = composer.field.handlers.onKey;
+		composer.field.handlers.onKey = (key: KeyEvent) => {
+			if (originalOnKey?.(key)) return true;
+			if (key.kind === "press" && key.text && key.id === key.text) {
+				composer.insertText(key.text);
+				return true;
+			}
+			return false;
+		};
+		const harness = createInputHarness();
+		const dispatchInput = (
+			event: InputEvent,
+			options?: { readonly after?: (event: InputEvent) => boolean },
+		): string => {
+			if (options?.after?.(event)) return "held";
+			if (harness.interceptors.toReversed().some(handler => handler(event))) return "intercepted";
+			const focused = composer.field;
+			if (event.type === "paste") {
+				if (focused.handlers.onPaste?.(event.paste)) return "composer";
+				composer.insertText(event.paste.text);
+				return "composer";
+			}
+			if (event.type !== "key") return "unhandled";
+			if (focused.handlers.onKey?.(event.key)) return "composer";
+			if (harness.globalKeys.toReversed().some(handler => handler(event.key))) return "global";
+			return "unhandled";
+		};
+
+		const session = {
+			isStreaming: false,
+			isCompacting: false,
+			isBashRunning: false,
+			isEvalRunning: false,
+			queuedMessageCount: 0,
+			extensionRunner: undefined,
+			customCommands: [],
+			promptTemplates: [],
+			slashCommands: [],
+			prompt: vi.fn(async () => true),
+			followUp: vi.fn(async () => {}),
+			hasInterruptibleInput: false,
+			prewarmModelConnection: vi.fn(),
+			resolveModelMention: () => undefined,
+			modelMentions: [],
+		};
+
+		const ctx = {
+			composer,
+			keybindings: KeybindingsManager.inMemory(),
+			settings: Settings.isolated(),
+			...harness.context,
+			shell: {
+				focused: () => composer.field,
+				host: undefined,
+				overlays: { open: () => false },
+				input: dispatchInput,
+			},
+			session,
+			viewSession: session,
+			sessionManager: { putBlob: vi.fn(), getSessionId: () => "raw-paste-test" },
+			dictationSpaceHold: vi.fn(),
+			compactionQueuedMessages: [],
+			skillCommands: new Map(),
+			fileSlashCommands: new Set<string>(),
+			locallySubmittedUserSignatures: new Set<string>(),
+			mcpTestEscapeHandlers: new Set<() => void>(),
+			isBashMode: false,
+			isPythonMode: false,
+			lastSigintTime: 0,
+			hasActiveBtw: () => false,
+			hasActiveOmfg: () => false,
+			hasActiveCleanse: () => false,
+			dismissCommandReport: () => false,
+			updateEditorBorderColor: vi.fn(),
+			updatePendingMessagesDisplay: vi.fn(),
+			syncIdleMaintenanceView: vi.fn(),
+			flushPendingExecRuns: vi.fn(),
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+			handleClearCommand: vi.fn(),
+			resetDisplayAfterAppearanceRefresh: vi.fn(),
+			shutdown: vi.fn(async () => {}),
+			clearEditor: () => composer.clearDraft(),
+			focusAsk: () => false,
+			withLocalSubmission: async <T>(_text: string, submit: () => Promise<T>): Promise<T> => submit(),
+			isGuidedGoalInterviewActive: () => false,
+			isBtwFocused: false,
+			handlesBtwBranchKey: () => false,
+			canFollowUpBtw: () => false,
+			canCopyBtw: () => false,
+			linkHintsActive: false,
+			startLinkHints: () => false,
+			cancelLinkHints: () => {},
+		} as unknown as InteractiveModeContext;
+
+		const clipboard = Promise.withResolvers<string>();
+		const controller = new InputController(ctx, {
+			readImage: async () => null,
+			readText: async () => {
+				return clipboard.promise;
+			},
+		});
+		controller.setupKeyHandlers();
+
+		const pasting = controller.handleClipboardTextRawPaste();
+		expect(controller.pasteInFlight()).toBe(true);
+
+		expect(dispatchInput({ type: "key", key: keyEvent("x") })).toBe("intercepted");
+		expect(composer.text()).toBe("");
+
+		clipboard.resolve("pasted raw");
+		// The hold-replay callback is attached to the raw paste promise before the caller
+		// awaits it, so the held key is replayed before this await resumes.
+		await pasting;
+
+		expect(controller.pasteInFlight()).toBe(false);
+		expect(composer.text()).toBe("pasted rawx");
 	});
 });

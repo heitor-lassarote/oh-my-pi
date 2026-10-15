@@ -258,6 +258,8 @@ import { invokeSkillCommandFromText, isKnownSkillCommand } from "./skill-command
 import type {
 	AgentHubOpenOptions,
 	AssistantView,
+	ApprovalSubmitOptions,
+	ApprovalSubmitOutcome,
 	DockModels,
 	ExecRunPresentation,
 	PendingTool,
@@ -7360,6 +7362,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	showEditorAreaDialog(factory: () => JSXNode, options?: OverlayOptions): OverlayHandle {
 		this.#editorAreaDialog?.close();
+		const previousHome = this.shell.home();
 		const view = mountNode(factory, "An editor-area dialog");
 		const frame = this.#frame;
 		let closed = false;
@@ -7376,7 +7379,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				const held = focused !== null && (focused === view.node || within(focused, view.node));
 				if (frame.editorArea.peek() === view.node) {
 					frame.editorArea.set(undefined);
-					this.shell.setHome(this.composer.field);
+					if (this.shell.home() === view.node) {
+						this.shell.setHome(previousHome && !previousHome.disposed ? previousHome : this.composer.field);
+					}
 				}
 				view.dispose();
 				if (held) this.shell.focus(null);
@@ -8321,6 +8326,18 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	handleImagePaste(): Promise<boolean> {
 		return this.#inputController.handleImagePaste();
+	}
+
+	pasteInFlight(): boolean {
+		return this.#inputController.pasteInFlight();
+	}
+
+	handleClipboardTextRawPaste(): Promise<void> {
+		return this.#inputController.handleClipboardTextRawPaste();
+	}
+
+	submitApprovalNote(text: string, options?: ApprovalSubmitOptions): Promise<ApprovalSubmitOutcome> {
+		return this.#inputController.submitApprovalNote(text, options);
 	}
 
 	handleImagePathPaste(path: string): Promise<void> {

@@ -9,7 +9,10 @@
  * Enter and the approve keys are ignored for {@link APPROVE_ARM_MS} after the
  * prompt opens, so a key already in flight cannot answer it. With a draft
  * host, typing edits the composer draft; submitting it steers and denies the
- * call. An explicit Deny leaves the draft in place.
+ * call. `app.approval.approve` sends the draft as a note that names the call
+ * it approves; it does nothing while a paste is still landing. A host that
+ * dispatches a command of its own keeps the prompt open and the countdown
+ * paused until it settles. An explicit Deny leaves the draft in place.
  */
 import {
 	type Accessor,
@@ -60,6 +63,8 @@ export interface ApprovalDialogOptions {
 	/** The composer draft typing goes to (deny and steer). */
 	readonly draft?: {
 		readonly hasDraft: Accessor<boolean>;
+		/** A clipboard paste still landing: the approve chord does nothing until the paste arrives. */
+		readonly pasteInFlight?: Accessor<boolean>;
 		handleInput(key: KeyEvent): void;
 		handlePaste(paste: PasteEvent): void;
 	};
@@ -78,7 +83,11 @@ export interface ApprovalDialogOptions {
 export interface ApprovalDialogProps {
 	readonly prompt: string;
 	readonly options?: ApprovalDialogOptions;
-	onApprove(choice: ApprovalChoice): void;
+	/**
+	 * Approve `choice`. A promise means the host is dispatching something of its own: the countdown
+	 * waits while it runs, and resolving `true` leaves the prompt open for the next key.
+	 */
+	onApprove(choice: ApprovalChoice): void | Promise<boolean>;
 	/** Deny without sending or clearing the draft. */
 	onDeny(): void;
 }
@@ -148,14 +157,52 @@ export function ApprovalDialog(props: ApprovalDialogProps): JSXNode {
 		return "Deny";
 	};
 	const armed = () => now() - openedAt >= APPROVE_ARM_MS;
+	// The countdown: restarted by every key, it denies when it runs out. A dispatched command holds
+	// it while it owns the keys, so a slow `/settings` cannot deny the call it was asked about.
+	const timeout = options.timeout !== undefined && options.timeout > 0 ? options.timeout : undefined;
+	let timer: Timer | undefined;
+	let commandPending = false;
+	let disposed = false;
+	const startCountdown = (): void => {
+		if (disposed || timeout === undefined || commandPending) return;
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			options.onTimeout?.();
+			props.onDeny();
+		}, timeout);
+	};
+	const resetCountdown = () => {
+		if (timeout === undefined) return;
+		startCountdown();
+		options.onTimeoutReset?.();
+	};
+	/** Approve `choice`; a promise from the host holds the countdown until its dispatch settles. */
+	const approve = (choice: ApprovalChoice): void => {
+		const result = props.onApprove(choice);
+		if (!(result instanceof Promise)) return;
+		commandPending = true;
+		clearTimeout(timer);
+		void result.then(
+			keep => {
+				if (disposed) return;
+				commandPending = false;
+				if (keep) startCountdown();
+			},
+			() => {
+				if (disposed) return;
+				commandPending = false;
+				props.onDeny();
+			},
+		);
+	};
 	const choose = (id: string) => {
 		if (!ids.includes(id)) return;
 		if (id === "remember") remember.set(!untrack(remember));
 		else if (id === "deny") props.onDeny();
 		else if (!armed()) return;
-		else if (id === "once") props.onApprove({ kind: "once" });
-		else if (id === "session") props.onApprove({ kind: "session" });
-		else props.onApprove({ kind: "grant", index: Number(id.slice(5)), remember: untrack(remember) });
+		else if (id === "once") approve({ kind: "once" });
+		else if (id === "session") approve({ kind: "session" });
+		else approve({ kind: "grant", index: Number(id.slice(5)), remember: untrack(remember) });
 	};
 	const move = (delta: number) => {
 		const at = ids.indexOf(untrack(selected));
@@ -176,26 +223,13 @@ export function ApprovalDialog(props: ApprovalDialogProps): JSXNode {
 		offset.set(0);
 	};
 	const details = (): string[] => (expanded() && full ? full : summary.slice(1));
-	// The countdown: restarted by every key, it denies when it runs out.
-	const timeout = options.timeout !== undefined && options.timeout > 0 ? options.timeout : undefined;
-	let timer: Timer | undefined;
-	const startCountdown = (): void => {
-		if (timeout === undefined) return;
+	onCleanup(() => {
+		disposed = true;
 		clearTimeout(timer);
-		timer = setTimeout(() => {
-			options.onTimeout?.();
-			props.onDeny();
-		}, timeout);
-	};
-	const resetCountdown = () => {
-		if (timeout === undefined) return;
-		startCountdown();
-		options.onTimeoutReset?.();
-	};
+	});
 	if (timeout !== undefined) {
 		options.onTimeoutStart?.();
 		startCountdown();
-		onCleanup(() => clearTimeout(timer));
 	}
 	return (
 		<col
@@ -213,7 +247,10 @@ export function ApprovalDialog(props: ApprovalDialogProps): JSXNode {
 				if (key.kind === "release") return false;
 				resetCountdown();
 				if (matchesAnyKey(key, appApproveKeys())) {
-					if (armed()) props.onApprove({ kind: "once" });
+					// A dispatched command owns the keys until it settles: a second chord would answer the prompt twice.
+					if (commandPending) return true;
+					// A paste still landing is a draft that isn't finished: the chord waits for it.
+					if (armed() && !options.draft?.pasteInFlight?.()) approve({ kind: "once" });
 					return true;
 				}
 				if (matchesAnyKey(key, appToolsExpandKeys())) {
@@ -263,7 +300,8 @@ export function ApprovalDialog(props: ApprovalDialogProps): JSXNode {
 			}}
 			onAction={act => {
 				if (act === "approve") {
-					if (armed()) props.onApprove({ kind: "once" });
+					if (commandPending) return;
+					if (armed() && !options.draft?.pasteInFlight?.()) approve({ kind: "once" });
 				} else if (act === "deny") props.onDeny();
 				else if (act === "expand") toggle();
 			}}

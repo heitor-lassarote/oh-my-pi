@@ -1,5 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, spyOn, vi } from "bun:test";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, Agent } from "@oh-my-pi/pi-agent-core";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { jsx } from "@oh-my-pi/pi-tui";
 import { bubbleEvent } from "@oh-my-pi/pi-tui/dispatch";
 import type { TestTerminal } from "@oh-my-pi/pi-tui/testing/terminal";
 import { setTerminalHeadless } from "@oh-my-pi/pi-utils";
@@ -8,7 +10,9 @@ import type { ExtensionRows } from "../../../src/extensibility/extensions/render
 import { isSettingsInitialized, Settings } from "../../../src/config/settings";
 import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
 import { InputController } from "../../../src/modes/controllers/input-controller";
-import type { InteractiveModeContext } from "../../../src/modes/types";
+import type { ApprovalSubmitOptions, ApprovalSubmitOutcome, InteractiveModeContext } from "../../../src/modes/types";
+import { APPROVE_ARM_MS } from "../../../src/modes/view-model/overlays/approval-dialog";
+import type { PromptOptions, SteerOptions } from "../../../src/session/agent-session-types";
 import { initTheme } from "../../../src/ui/theme/service";
 import * as externalEditor from "../../../src/utils/external-editor";
 import {
@@ -30,15 +34,43 @@ function makeHarness() {
 	const agent = new Agent();
 	const steeringChips = () =>
 		agent.peekSteeringQueue().map(message => (message.role === "user" ? String(message.content) : ""));
+	const steerCalls: { text: string; images: ImageContent[] | undefined; options?: SteerOptions }[] = [];
+	const sentMessages: { message: unknown; options: unknown }[] = [];
+	/** Steer the way `AgentSession.steer` does: report the queued messages, then push them onto the queue. */
+	const steerMock = vi.fn(async (text: string, images?: ImageContent[], options?: SteerOptions) => {
+		steerCalls.push({ text, images, options });
+		const message = { role: "user", content: text, timestamp: Date.now() } as AgentMessage;
+		options?.onPromptQueued?.([message]);
+		agent.steer(message);
+	});
+	/** Skill dispatch pushes its custom message onto the steering queue, as the session would. */
+	const promptCustomMessage = vi.fn(async (message: unknown, options?: PromptOptions) => {
+		sentMessages.push({ message, options });
+		const queued = {
+			role: "custom",
+			customType: "skill-prompt",
+			content: "",
+			timestamp: Date.now(),
+		} as AgentMessage;
+		options?.onPromptQueued?.([queued]);
+		agent.steer(queued);
+		return true;
+	});
 	const ctx: InteractiveModeContext = createInteractiveModeContext({
 		session: {
 			agent,
 			setUsageFallbackConfirmer: vi.fn(),
+			// Slash-command dispatch consults these for every submission.
+			customCommands: [],
+			promptTemplates: [],
 			getQueuedMessages: () => ({ steering: steeringChips(), followUp: [], liveSteered: 0 }),
 			subscribe: ((listener: (event: { type: string; steering?: string[] }) => void) =>
 				agent.onQueueChange(() =>
 					listener({ type: "queue_update", steering: steeringChips() }),
 				)) as unknown as InteractiveModeContext["session"]["subscribe"],
+			steer: steerMock as unknown as InteractiveModeContext["session"]["steer"],
+			promptCustomMessage:
+				promptCustomMessage as unknown as InteractiveModeContext["session"]["promptCustomMessage"],
 		},
 		setToolUIContext: (context: ExtensionUIContext, hasUI: boolean) => {
 			expect(hasUI).toBe(true);
@@ -49,12 +81,20 @@ function makeHarness() {
 	const term: TestTerminal = attachTerminal(ctx);
 	const controller = new ExtensionUiController(ctx);
 	const composer = ctx.composer;
+	/** The chord goes through the real submit path; a harness overrides it when it wants a stubbed outcome. */
+	const submitApprovalNote = (text: string, options?: ApprovalSubmitOptions) =>
+		new InputController(ctx, { readImage: async () => null, readText: async () => "" }).submitApprovalNote(
+			text,
+			options,
+		);
+	ctx.submitApprovalNote = submitApprovalNote;
 	return {
 		ctx,
 		term,
 		composer,
 		controller,
 		agent,
+		submitApprovalNote,
 		askSlot: () => ctx.shell.dock.slot("ask").occupied(),
 		approvalSlot: () => ctx.shell.dock.slot("approval").occupied(),
 		/** The screen as it paints now, plain. */
@@ -80,12 +120,29 @@ function makeHarness() {
 			expect(uiContext).toBeDefined();
 			return uiContext!;
 		},
+		get steering(): string[] {
+			return steeringChips();
+		},
+		get steer() {
+			return steerMock;
+		},
+		get steerCalls() {
+			return steerCalls;
+		},
+		get sentMessages(): { message: unknown; options: unknown }[] {
+			return sentMessages;
+		},
 	};
 }
 
 /** Settle the microtasks `showHookCustom`'s factory chain and nested prompts run on. */
 async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 4; i++) await Promise.resolve();
+}
+
+/** Drain a deep chord submit chain: hooks, dispatch, queue notifications and the dialog settle. */
+async function settleChord(): Promise<void> {
+	for (let i = 0; i < 10; i++) await Promise.resolve();
 }
 
 describe("ExtensionUiController form dialog", () => {
@@ -511,6 +568,7 @@ describe("ExtensionUiController tool approval", () => {
 	const prompt = {
 		full: "Allow tool: bash\nCommand: rm -rf build",
 		compact: "Allow tool: bash\nCommand: rm -rf build",
+		toolName: "bash",
 	};
 	let now = 1_000;
 	beforeEach(() => {
@@ -631,6 +689,238 @@ describe("ExtensionUiController tool approval", () => {
 		expect(await pending).toBe("deny");
 		expect(harness.ctx.composerOwner).toBeUndefined();
 		expect(harness.ctx.approvalOwnsComposer).toBe(false);
+	});
+
+	it("Ctrl+Enter with an empty composer approves outright", async () => {
+		const harness = makeHarness();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.press("ctrl+enter");
+		expect(await pending).toBe("once");
+		expect(harness.steerCalls).toHaveLength(0);
+		expect(harness.steering).toHaveLength(0);
+	});
+
+	it("Ctrl+Enter with a draft sends the note naming the call it approves, and settles without denying itself", async () => {
+		const harness = makeHarness();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.type("watch the build");
+		harness.term.press("ctrl+enter");
+		expect(await pending).toBe("once");
+		expect(harness.composer.text()).toBe("");
+		expect(harness.steerCalls).toEqual([
+			{
+				text: "watch the build",
+				images: undefined,
+				options: expect.objectContaining({ attribution: "user" }),
+			},
+		]);
+		expect(harness.steerCalls[0]!.options!.approvalLine).toContain("`bash`");
+		expect(harness.agent.peekSteeringQueue()).toHaveLength(1);
+	});
+
+	it("approve chord does not deny the other approvals queued in the same batch", async () => {
+		const harness = makeHarness();
+		const first = harness.controller.showCollabAwareApproval(prompt);
+		const second = harness.controller.showCollabAwareApproval({ ...prompt, toolName: "write" });
+		now = 2_000;
+		harness.term.type("note");
+		harness.term.press("ctrl+enter");
+		expect(await first).toBe("once");
+		// The note is the chord's own steer, not a deny: the next prompt stays up.
+		await flushMicrotasks();
+		expect(harness.approvalSlot()).toBe(true);
+		now = 3_000;
+		harness.term.press("ctrl+enter");
+		expect(await second).toBe("once");
+		expect(harness.steerCalls).toHaveLength(1);
+	});
+
+	it("ignores the approve chord while a raw paste is landing", async () => {
+		const harness = makeHarness();
+		const clipboard = Promise.withResolvers<string>();
+		const input = new InputController(harness.ctx, {
+			readImage: async () => null,
+			readText: () => clipboard.promise,
+			readMacFileUrls: async () => [],
+			isTerminalLocal: () => true,
+		});
+		input.setupKeyHandlers();
+		harness.ctx.handleClipboardTextRawPaste = () => input.handleClipboardTextRawPaste();
+		harness.ctx.pasteInFlight = () => input.pasteInFlight();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		const pasting = harness.ctx.handleClipboardTextRawPaste();
+		harness.term.press("ctrl+enter");
+		await flushMicrotasks();
+		// A paste still landing is a draft that isn't finished: the chord waits for it.
+		expect(input.pasteInFlight()).toBe(true);
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.steerCalls).toHaveLength(0);
+		clipboard.resolve("watch the build");
+		await pasting;
+		// The held chord replays once the paste lands, with the pasted note in hand.
+		expect(await pending).toBe("once");
+		expect(harness.steerCalls).toEqual([{ text: "watch the build", images: undefined, options: expect.anything() }]);
+	});
+
+	it("leaves the approval pending when the chord dispatches a command instead of steering", async () => {
+		const harness = makeHarness();
+		harness.ctx.submitApprovalNote = async () => "dispatched";
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.type("/settings");
+		harness.term.press("ctrl+enter");
+		await flushMicrotasks();
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.steerCalls).toHaveLength(0);
+		expect(harness.composer.text()).toBe("");
+		harness.term.press("escape");
+		expect(await pending).toBe("deny");
+	});
+
+	it("returns focus to the approval after an editor-area dialog closes", async () => {
+		const harness = makeHarness();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		const approval = harness.ctx.shell.focused();
+		expect(harness.ctx.shell.home()).toBe(approval);
+		const dialog = harness.ctx.showEditorAreaDialog(() => jsx("text", { text: "modal" }));
+		expect(harness.ctx.shell.focused()).toBe(dialog.node);
+		dialog.close();
+		expect(harness.ctx.shell.focused()).toBe(approval);
+		expect(harness.ctx.shell.home()).toBe(approval);
+		harness.term.press("ctrl+enter");
+		expect(await pending).toBe("once");
+		expect(harness.ctx.shell.focused()).toBe(harness.composer.field);
+	});
+
+	it("an editor-area dialog closing over an approval leaves Escape as deny", async () => {
+		const harness = makeHarness();
+		const abort = vi.spyOn(harness.ctx.session, "abort");
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		const approval = harness.ctx.shell.focused();
+		const dialog = harness.ctx.showEditorAreaDialog(() => jsx("text", { text: "modal" }));
+		expect(harness.ctx.shell.focused()).toBe(dialog.node);
+		dialog.close();
+		expect(harness.ctx.shell.focused()).toBe(approval);
+		harness.term.press("escape");
+		expect(await pending).toBe("deny");
+		expect(harness.ctx.session.isAborting).toBe(false);
+		expect(abort).not.toHaveBeenCalled();
+		expect(harness.ctx.shell.focused()).toBe(harness.composer.field);
+	});
+
+	it("leaves focus on an open editor-area dialog when the approval settles under it", async () => {
+		const harness = makeHarness();
+		const abort = new AbortController();
+		const pending = harness.controller.showCollabAwareApproval(prompt, { signal: abort.signal });
+		now = 2_000;
+		const dialog = harness.ctx.showEditorAreaDialog(() => jsx("text", { text: "modal" }));
+		expect(harness.ctx.shell.focused()).toBe(dialog.node);
+		abort.abort();
+		await pending;
+		expect(harness.approvalSlot()).toBe(false);
+		// The approval went away while the dialog held the keys: the dialog keeps them.
+		expect(harness.ctx.shell.focused()).toBe(dialog.node);
+		dialog.close();
+		expect(harness.ctx.shell.focused()).toBe(harness.composer.field);
+	});
+
+	it("holds the countdown while a dispatched command owns the keys, and resumes after it settles", async () => {
+		// The dialog's countdown is a timer; run it on a fake clock so the test never sleeps on
+		// wall time. The countdown is longer than the arm window, so advancing past the window
+		// cannot deny the call the test is still waiting on.
+		vi.useFakeTimers({ now: 0 });
+		try {
+			const harness = makeHarness();
+			const onTimeout = vi.fn();
+			const dispatch = Promise.withResolvers<ApprovalSubmitOutcome>();
+			harness.ctx.submitApprovalNote = () => dispatch.promise;
+			const pending = harness.controller.showCollabAwareApproval(prompt, { timeout: APPROVE_ARM_MS * 2, onTimeout });
+			harness.term.type("what does /settings say about the model?");
+			harness.term.press("ctrl+enter");
+			// Inside the arm window: ignored, and the countdown has not run out.
+			expect(harness.approvalSlot()).toBe(true);
+			vi.advanceTimersByTime(APPROVE_ARM_MS + 1);
+			expect(onTimeout).not.toHaveBeenCalled();
+			harness.term.press("ctrl+enter");
+			vi.advanceTimersByTime(60); // past the countdown, while the command owns the keys
+			await settleChord();
+			expect(onTimeout).not.toHaveBeenCalled();
+			// A second chord while the command runs answers nothing.
+			harness.term.press("ctrl+enter");
+			expect(harness.approvalSlot()).toBe(true);
+			expect(harness.steerCalls).toHaveLength(0);
+			dispatch.resolve("dispatched");
+			await settleChord();
+			expect(harness.approvalSlot()).toBe(true);
+			vi.advanceTimersByTime(APPROVE_ARM_MS * 2); // the countdown resumes for whatever comes next
+			await settleChord();
+			expect(onTimeout).toHaveBeenCalledTimes(1);
+			expect(await pending).toBe("deny");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps the approval pending when the chord's steer fails", async () => {
+		const harness = makeHarness();
+		// The session refuses the note: the chord must report it and hand the draft back.
+		Object.assign(harness.ctx.session, {
+			steer: async () => {
+				throw new Error("queue rejected");
+			},
+		});
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.type("watch the build");
+		harness.term.press("ctrl+enter");
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.ctx.showError).toHaveBeenCalledWith("queue rejected");
+		expect(harness.composer.text()).toBe("watch the build");
+		harness.term.press("escape");
+		expect(await pending).toBe("deny");
+	});
+
+	it("keeps the approval pending when the chord sends an empty queue shorthand", async () => {
+		const harness = makeHarness();
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.type("/queue");
+		harness.term.press("ctrl+enter");
+		await flushMicrotasks();
+		expect(harness.approvalSlot()).toBe(true);
+		expect(harness.steerCalls).toHaveLength(0);
+		expect(harness.composer.text()).toBe("/queue");
+		harness.term.press("escape");
+		expect(await pending).toBe("deny");
+	});
+
+	it("dismisses the completion popup when approving and steering", async () => {
+		const harness = makeHarness();
+		harness.composer.setAutocomplete({
+			applyCompletion: (_lines, _cursorLine, _cursorCol, item) => ({
+				lines: [item.value],
+				cursorLine: 0,
+				cursorCol: item.value.length,
+			}),
+			getSuggestions: async () => ({ items: [{ value: "/skills", label: "/skills" }], prefix: "/sk" }),
+			trySyncSlashCompletion: before =>
+				before.startsWith("/sk") ? { items: [{ value: "/skills", label: "/skills" }], prefix: "/sk" } : null,
+		});
+		const pending = harness.controller.showCollabAwareApproval(prompt);
+		now = 2_000;
+		harness.term.type("/sk");
+		await flushMicrotasks();
+		expect(harness.composer.completing()).toBe(true);
+		harness.term.press("ctrl+enter");
+		expect(await pending).toBe("once");
+		// The chord clears the composer before dispatch; that is what keeps the popup from surviving it.
+		expect(harness.composer.completing()).toBe(false);
 	});
 
 	it("lets the composer steer while a call waits: the queued message denies the call", async () => {
